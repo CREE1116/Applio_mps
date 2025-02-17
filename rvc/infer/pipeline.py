@@ -1,3 +1,4 @@
+
 import os
 import gc
 import re
@@ -10,6 +11,7 @@ import librosa
 import numpy as np
 from scipy import signal
 from torch import Tensor
+import traceback  # traceback import 추가
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -86,6 +88,7 @@ class AudioProcessor:
         return adjusted_audio
 
 
+
 class Autotune:
     """
     A class for applying autotune to a given fundamental frequency (F0) contour.
@@ -116,25 +119,15 @@ class Autotune:
 
 
 class Pipeline:
-    """
-    The main pipeline class for performing voice conversion, including preprocessing, F0 estimation,
-    voice conversion using a model, and post-processing.
-    """
-
+    # ... (get_f0_crepe, get_f0_hybrid, get_f0 내용은 이전 수정본과 동일)
     def __init__(self, tgt_sr, config):
-        """
-        Initializes the Pipeline class with target sampling rate and configuration parameters.
-
-        Args:
-            tgt_sr: The target sampling rate for the output audio.
-            config: A configuration object containing various parameters for the pipeline.
-        """
+        """Initializes the Pipeline class with window size."""
         self.x_pad = config.x_pad
         self.x_query = config.x_query
         self.x_center = config.x_center
         self.x_max = config.x_max
         self.sample_rate = 16000
-        self.window = 160
+        self.window = 160  # window size 속성 추가 (해결!)
         self.t_pad = self.sample_rate * self.x_pad
         self.t_pad_tgt = tgt_sr * self.x_pad
         self.t_pad2 = self.t_pad * 2
@@ -147,6 +140,7 @@ class Pipeline:
         self.f0_mel_min = 1127 * np.log(1 + self.f0_min / 700)
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
         self.device = config.device
+        print(f"Pipeline 초기화: device = {self.device}")  # Pipeline device 확인
         self.ref_freqs = [
             49.00,  # G1
             51.91,  # G#1 / Ab1
@@ -205,10 +199,14 @@ class Pipeline:
         ]
         self.autotune = Autotune(self.ref_freqs)
         self.note_dict = self.autotune.note_dict
+        # Initialize RMVPE, but might not be used if f0_method is None
         self.model_rmvpe = RMVPE0Predictor(
             os.path.join("rvc", "models", "predictors", "rmvpe.pt"),
             device=self.device,
         )
+        print(f"RMVPE 모델 로드 완료, device: {self.device}")  # RMVPE 모델 device 확인
+
+        self.f0_method = None  # Default to None for no F0 estimation
 
     def get_f0_crepe(
         self,
@@ -221,21 +219,14 @@ class Pipeline:
     ):
         """
         Estimates the fundamental frequency (F0) of a given audio signal using the Crepe model.
-
-        Args:
-            x: The input audio signal as a NumPy array.
-            f0_min: Minimum F0 value to consider.
-            f0_max: Maximum F0 value to consider.
-            p_len: Desired length of the F0 output.
-            hop_length: Hop length for the Crepe model.
-            model: Crepe model size to use ("full" or "tiny").
         """
         x = x.astype(np.float32)
         x /= np.quantile(np.abs(x), 0.999)
         audio = torch.from_numpy(x).to(self.device, copy=True)
+        print(f"Crepe 입력 오디오 텐서 device: {audio.device}")  # Crepe 입력 텐서 device 확인
         audio = torch.unsqueeze(audio, dim=0)
         if audio.ndim == 2 and audio.shape[0] > 1:
-            audio = torch.mean(audio, dim=0, keepdim=True).detach()
+            audio = torch.mean(audio, dim=0, keepdim=True)  # .detach() 제거: 불필요한 detach 제거
         audio = audio.detach()
         pitch: Tensor = torchcrepe.predict(
             audio,
@@ -248,15 +239,16 @@ class Pipeline:
             device=self.device,
             pad=True,
         )
+        print(f"Crepe 출력 pitch 텐서 device: {pitch.device}")  # Crepe 출력 텐서 device 확인
         p_len = p_len or x.shape[0] // hop_length
-        source = np.array(pitch.squeeze(0).cpu().float().numpy())
+        source = np.array(pitch.squeeze(0).cpu().float().numpy())  # pitch tensor를 numpy array로 변환 (기존 코드 유지)
         source[source < 0.001] = np.nan
         target = np.interp(
             np.arange(0, len(source) * p_len, len(source)) / p_len,
             np.arange(0, len(source)),
             source,
-        )
-        f0 = np.nan_to_num(target)
+        )  # f0 interpolation (기존 코드 유지)
+        f0 = np.nan_to_num(target)  # NaN 값을 0으로 채우기 (기존 코드 유지)
         return f0
 
     def get_f0_hybrid(
@@ -270,14 +262,6 @@ class Pipeline:
     ):
         """
         Estimates the fundamental frequency (F0) using a hybrid approach combining multiple methods.
-
-        Args:
-            methods_str: A string specifying the methods to combine (e.g., "hybrid[crepe+rmvpe]").
-            x: The input audio signal as a NumPy array.
-            f0_min: Minimum F0 value to consider.
-            f0_max: Maximum F0 value to consider.
-            p_len: Desired length of the F0 output.
-            hop_length: Hop length for F0 estimation methods.
         """
         methods_str = re.search("hybrid\[(.+)\]", methods_str)
         if methods_str:
@@ -294,9 +278,10 @@ class Pipeline:
                 )
             elif method == "rmvpe":
                 f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+                print(f"RMVPE F0 device: {f0.device if isinstance(f0, torch.Tensor) else 'NumPy Array'}")  # RMVPE F0 device 확인
                 f0 = f0[1:]
             elif method == "fcpe":
-                self.model_fcpe = FCPEF0Predictor(
+                self.model_fcpe = FCPEF0Predictor(  # FCPEF0Predictor 객체 생성 (기존 코드 유지)
                     os.path.join("rvc", "models", "predictors", "fcpe.pt"),
                     f0_min=int(f0_min),
                     f0_max=int(f0_max),
@@ -305,7 +290,9 @@ class Pipeline:
                     sample_rate=self.sample_rate,
                     threshold=0.03,
                 )
-                f0 = self.model_fcpe.compute_f0(x, p_len=p_len)
+                print(f"FCPE 모델 로드 완료, device: {self.model_fcpe.device}")  # FCPE 모델 device 확인
+                f0 = self.model_fcpe.compute_f0(x, p_len=p_len)  # FCPEF0Predictor를 사용하여 F0 계산 (기존 코드 유지)
+                print(f"FCPE F0 device: {f0.device}")  # FCPE F0 device 확인
                 del self.model_fcpe
                 gc.collect()
             f0_computation_stack.append(f0)
@@ -332,18 +319,9 @@ class Pipeline:
     ):
         """
         Estimates the fundamental frequency (F0) of a given audio signal using various methods.
-
-        Args:
-            input_audio_path: Path to the input audio file.
-            x: The input audio signal as a NumPy array.
-            p_len: Desired length of the F0 output.
-            pitch: Key to adjust the pitch of the F0 contour.
-            f0_method: Method to use for F0 estimation (e.g., "crepe").
-            hop_length: Hop length for F0 estimation methods.
-            f0_autotune: Whether to apply autotune to the F0 contour.
-            inp_f0: Optional input F0 contour to use instead of estimating.
         """
         global input_audio_path2wav
+        f0 = None  # Initialize f0 to None, will be used if f0_method is None
         if f0_method == "crepe":
             f0 = self.get_f0_crepe(x, self.f0_min, self.f0_max, p_len, int(hop_length))
         elif f0_method == "crepe-tiny":
@@ -352,6 +330,7 @@ class Pipeline:
             )
         elif f0_method == "rmvpe":
             f0 = self.model_rmvpe.infer_from_audio(x, thred=0.03)
+            print(f"RMVPE F0 device: {f0.device if isinstance(f0, torch.Tensor) else 'NumPy Array'}")  # RMVPE F0 device 확인
         elif f0_method == "fcpe":
             self.model_fcpe = FCPEF0Predictor(
                 os.path.join("rvc", "models", "predictors", "fcpe.pt"),
@@ -362,7 +341,9 @@ class Pipeline:
                 sample_rate=self.sample_rate,
                 threshold=0.03,
             )
+            print(f"FCPE 모델 로드 완료, device: {self.model_fcpe.device}")  # FCPE 모델 device 확인
             f0 = self.model_fcpe.compute_f0(x, p_len=p_len)
+            print(f"FCPE F0 device: {f0.device}")  # FCPE F0 device 확인
             del self.model_fcpe
             gc.collect()
         elif "hybrid" in f0_method:
@@ -376,32 +357,34 @@ class Pipeline:
                 hop_length,
             )
 
-        if f0_autotune is True:
-            f0 = Autotune.autotune_f0(self, f0, f0_autotune_strength)
+        if f0 is not None:  # Only apply autotune, pitch shift, and mel conversion if f0 was actually computed
+            if f0_autotune is True:  # F0 autotune 활성화 시 (기존 코드 유지)
+                f0 = Autotune.autotune_f0(self, f0, f0_autotune_strength)
 
-        f0 *= pow(2, pitch / 12)
-        tf0 = self.sample_rate // self.window
-        if inp_f0 is not None:
-            delta_t = np.round(
-                (inp_f0[:, 0].max() - inp_f0[:, 0].min()) * tf0 + 1
-            ).astype("int16")
-            replace_f0 = np.interp(
-                list(range(delta_t)), inp_f0[:, 0] * 100, inp_f0[:, 1]
-            )
-            shape = f0[self.x_pad * tf0 : self.x_pad * tf0 + len(replace_f0)].shape[0]
-            f0[self.x_pad * tf0 : self.x_pad * tf0 + len(replace_f0)] = replace_f0[
-                :shape
-            ]
-        f0bak = f0.copy()
-        f0_mel = 1127 * np.log(1 + f0 / 700)
-        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * 254 / (
-            self.f0_mel_max - self.f0_mel_min
-        ) + 1
-        f0_mel[f0_mel <= 1] = 1
-        f0_mel[f0_mel > 255] = 255
-        f0_coarse = np.rint(f0_mel).astype(int)
-
-        return f0_coarse, f0bak
+            f0 *= pow(2, pitch / 12)  # pitch shift 적용 (기존 코드 유지)
+            tf0 = self.sample_rate // self.window
+            if inp_f0 is not None:  # 외부 F0 파일 입력 시 (기존 코드 유지)
+                delta_t = np.round(
+                    (inp_f0[:, 0].max() - inp_f0[:, 0].min()) * tf0 + 1
+                ).astype("int16")
+                replace_f0 = np.interp(
+                    list(range(delta_t)), inp_f0[:, 0] * 100, inp_f0[:, 1]
+                )  # F0 interpolation (기존 코드 유지)
+                shape = f0[self.x_pad * tf0 : self.x_pad * tf0 + len(replace_f0)].shape[0]
+                f0[self.x_pad * tf0 : self.x_pad * tf0 + len(replace_f0)] = replace_f0[
+                    :shape
+                ]
+            f0bak = f0.copy()
+            f0_mel = 1127 * np.log(1 + f0 / 700)
+            f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * 254 / (
+                self.f0_mel_max - self.f0_mel_min  # Mel scale normalization (기존 코드 유지)
+            ) + 1
+            f0_mel[f0_mel <= 1] = 1
+            f0_mel[f0_mel > 255] = 255
+            f0_coarse = np.rint(f0_mel).astype(int)
+            return f0_coarse, f0bak  # F0 coarse, F0 original 반환 (기존 코드 유지)
+        else:  # f0_method is None, so return None for both f0_coarse and f0bak
+            return None, None
 
     def voice_conversion(
         self,
@@ -417,88 +400,108 @@ class Pipeline:
         version,
         protect,
     ):
-        """
-        Performs voice conversion on a given audio segment.
-
-        Args:
-            model: The feature extractor model.
-            net_g: The generative model for synthesizing speech.
-            sid: Speaker ID for the target voice.
-            audio0: The input audio segment.
-            pitch: Quantized F0 contour for pitch guidance.
-            pitchf: Original F0 contour for pitch guidance.
-            index: FAISS index for speaker embedding retrieval.
-            big_npy: Speaker embeddings stored in a NumPy array.
-            index_rate: Blending rate for speaker embedding retrieval.
-            version: Model version (Keep to support old models).
-            protect: Protection level for preserving the original pitch.
-        """
-        with torch.no_grad():
-            pitch_guidance = pitch != None and pitchf != None
-            # prepare source audio
-            feats = torch.from_numpy(audio0).float()
-            feats = feats.mean(-1) if feats.dim() == 2 else feats
-            assert feats.dim() == 1, feats.dim()
-            feats = feats.view(1, -1).to(self.device)
-            # extract features
-            feats = model(feats)["last_hidden_state"]
-            feats = (
-                model.final_proj(feats[0]).unsqueeze(0) if version == "v1" else feats
-            )
-            # make a copy for pitch guidance and protection
-            feats0 = feats.clone() if pitch_guidance else None
-            if (
-                index
-            ):  # set by parent function, only true if index is available, loaded, and index rate > 0
-                feats = self._retrieve_speaker_embeddings(
-                    feats, index, big_npy, index_rate
+        """Performs voice conversion with detailed logging."""
+        try:  # try-except 블록으로 감싸기
+            with torch.no_grad():
+                pitch_guidance = pitch is not None and pitchf is not None
+                # prepare source audio
+                feats = torch.from_numpy(audio0).float()
+                feats = feats.mean(-1) if feats.dim() == 2 else feats
+                assert feats.dim() == 1, feats.dim()
+                feats = feats.view(1, -1).to(self.device)
+                print(f"[VC START] Feature extractor 입력 텐서 device: {feats.device}")  # 로그 추가
+                # extract features
+                feats = model(feats)["last_hidden_state"]
+                print(f"[VC FEATS EXTRACTED] Feature extractor 출력 텐서 device: {feats.device}")  # 로그 추가
+                feats = (  # v1 모델에 final_proj 레이어 적용
+                    model.final_proj(feats[0]).unsqueeze(0) if version == "v1" else feats
                 )
-            # feature upsampling
-            feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
-                0, 2, 1
-            )
-            # adjust the length if the audio is short
-            p_len = min(audio0.shape[0] // self.window, feats.shape[1])
-            if pitch_guidance:
-                feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
+                print(f"[VC FINAL PROJ] Final proj 레이어 후 텐서 device: {feats.device}")  # 로그 추가
+                # make a copy for pitch guidance and protection
+                feats0 = feats.clone() if pitch_guidance else None
+                if index is not None and index_rate > 0:
+                    print("[VC INDEX RETRIEVAL START]")  # 로그 추가
+                    feats = self._retrieve_speaker_embeddings(
+                        feats, index, big_npy, index_rate
+                    )
+                    print(
+                        f"[VC INDEX RETRIEVAL END] Speaker embedding retrieval 후 텐서 device: {feats.device}"
+                    )  # 로그 추가
+                # feature upsampling
+                print("[VC INTERPOLATION START]")  # 로그 추가
+                feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
                     0, 2, 1
                 )
-                pitch, pitchf = pitch[:, :p_len], pitchf[:, :p_len]
-                # Pitch protection blending
-                if protect < 0.5:
-                    pitchff = pitchf.clone()
-                    pitchff[pitchf > 0] = 1
-                    pitchff[pitchf < 1] = protect
-                    feats = feats * pitchff.unsqueeze(-1) + feats0 * (
-                        1 - pitchff.unsqueeze(-1)
+                print(f"[VC INTERPOLATION END] Feature interpolation 후 텐서 device: {feats.device}")  # 로그 추가
+                # adjust the length if the audio is short
+                p_len = min(audio0.shape[0] // self.window, feats.shape[1])
+                if pitch_guidance:
+                    feats0 = F.interpolate(feats0.permute(0, 2, 1), scale_factor=2).permute(
+                        0, 2, 1
                     )
-                    feats = feats.to(feats0.dtype)
-            else:
-                pitch, pitchf = None, None
-            p_len = torch.tensor([p_len], device=self.device).long()
-            audio1 = (
-                (net_g.infer(feats.float(), p_len, pitch, pitchf.float(), sid)[0][0, 0])
-                .data.cpu()
-                .float()
-                .numpy()
-            )
-            # clean up
-            del feats, feats0, p_len
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        return audio1
+                    if pitch is not None and pitchf is not None:
+                        pitch, pitchf = pitch[:, :p_len], pitchf[:, :p_len]
+                        # Pitch protection blending
+                        if protect < 0.5:
+                            pitchff = pitchf.clone()
+                            pitchff[pitchf > 0] = 1
+                            pitchff[pitchf < 1] = protect
+                            feats = feats * pitchff.unsqueeze(-1) + feats0 * (
+                                1 - pitchff.unsqueeze(-1)
+                            )
+                            feats = feats.to(feats0.dtype)
+                    else:
+                        pitch_guidance = False
+                else:
+                    pitch, pitchf = None, None
+
+                p_len = torch.tensor([p_len], device=self.device).long()
+                print(f"[VC GENERATOR INFER START] Generator 입력 feats 텐서 device: {feats.device}")  # 로그 추가
+                print(
+                    f"[VC GENERATOR INFER START] Generator 입력 pitch 텐서 device: {pitch.device if pitch is not None else 'None'}"
+                )  # 로그 추가
+                print(
+                    f"[VC GENERATOR INFER START] Generator 입력 pitchf 텐서 device: {pitchf.device if pitchf is not None else 'None'}"
+                )  # 로그 추가
+                audio1 = (  # net_g.infer 호출하여 음성 합성
+                    (net_g.infer(feats.float(), p_len, pitch, pitchf.float(), sid)[0][0, 0])
+                    .data.cpu()
+                    .float()
+                    .numpy()
+                )
+                print("[VC GENERATOR INFER END]")  # 로그 추가
+                # clean up
+                del feats, feats0, p_len
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return audio1
+        except Exception as e:  # 예외 처리 블록
+            print(f"[VC ERROR] Error during voice conversion: {e}")  # 오류 메시지 출력
+            traceback.print_exc()  # 전체 traceback 정보 출력
+            return np.zeros_like(audio0, dtype=np.float32)  # 오류 발생 시 0으로 채워진 NumPy 배열 반환 (오류 전파 방지)
 
     def _retrieve_speaker_embeddings(self, feats, index, big_npy, index_rate):
-        npy = feats[0].cpu().numpy()
-        score, ix = index.search(npy, k=8)
-        weight = np.square(1 / score)
-        weight /= weight.sum(axis=1, keepdims=True)
-        npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-        feats = (
-            torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
-            + (1 - index_rate) * feats
-        )
-        return feats
+        print("[INDEX RETRIEVAL FUNCTION START]") # Log entry into the function
+        try:
+            npy = feats[0].cpu().numpy()
+            faiss.omp_set_num_threads(1)
+            print(f"[INDEX RETRIEVAL] feats[0] device after cpu(): {feats[0].device}") # Check device after .cpu()
+            print("[INDEX RETRIEVAL] Index search starting...") # Log before index.search
+            score, ix = index.search(npy, k=8)
+            print("[INDEX RETRIEVAL] Index search finished.") # Log after index.search
+            weight = np.square(1 / score)
+            weight /= weight.sum(axis=1, keepdims=True)
+            npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+            feats = (
+                torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
+                + (1 - index_rate) * feats
+            )
+            print(f"[INDEX RETRIEVAL FUNCTION END] Retrieved feats device: {feats.device}") # Log exit and feats device
+            return feats
+        except Exception as e:
+            print(f"[INDEX RETRIEVAL ERROR] Error during speaker embedding retrieval: {e}") # Error log inside the function
+            traceback.print_exc()
+            return feats # Return original feats in case of error, to avoid pipeline crash
 
     def pipeline(
         self,
@@ -519,38 +522,20 @@ class Pipeline:
         f0_autotune_strength,
         f0_file,
     ):
-        """
-        The main pipeline function for performing voice conversion.
-
-        Args:
-            model: The feature extractor model.
-            net_g: The generative model for synthesizing speech.
-            sid: Speaker ID for the target voice.
-            audio: The input audio signal.
-            input_audio_path: Path to the input audio file.
-            pitch: Key to adjust the pitch of the F0 contour.
-            f0_method: Method to use for F0 estimation.
-            file_index: Path to the FAISS index file for speaker embedding retrieval.
-            index_rate: Blending rate for speaker embedding retrieval.
-            pitch_guidance: Whether to use pitch guidance during voice conversion.
-            tgt_sr: Target sampling rate for the output audio.
-            resample_sr: Resampling rate for the output audio.
-            volume_envelope: Blending rate for adjusting the RMS level of the output audio.
-            version: Model version.
-            protect: Protection level for preserving the original pitch.
-            hop_length: Hop length for F0 estimation methods.
-            f0_autotune: Whether to apply autotune to the F0 contour.
-            f0_file: Path to a file containing an F0 contour to use.
-        """
+        """The main pipeline function with try-except for error capture."""
+        index = None
+        big_npy = None
         if file_index != "" and os.path.exists(file_index) and index_rate > 0:
             try:
                 index = faiss.read_index(file_index)
                 big_npy = index.reconstruct_n(0, index.ntotal)
-            except Exception as error:
-                print(f"An error occurred reading the FAISS index: {error}")
+            except Exception as e:
+                print(f"[PIPELINE INDEX ERROR] An error occurred reading the FAISS index: {e}")  # 오류 로그 강화
+                traceback.print_exc()  # traceback 정보 출력
                 index = big_npy = None
         else:
             index = big_npy = None
+
         audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
         opt_ts = []
@@ -581,12 +566,16 @@ class Pipeline:
                 for line in lines:
                     inp_f0.append([float(i) for i in line.split(",")])
                 inp_f0 = np.array(inp_f0, dtype="float32")
-            except Exception as error:
-                print(f"An error occurred reading the F0 file: {error}")
+            except Exception as e:
+                print(f"[PIPELINE F0 FILE ERROR] An error occurred reading the F0 file: {e}")  # 오류 로그 강화
+                traceback.print_exc()  # traceback 정보 출력
         sid = torch.tensor(sid, device=self.device).unsqueeze(0).long()
-        if pitch_guidance:
-            pitch, pitchf = self.get_f0(
-                "input_audio_path",  # questionable purpose of making a key for an array
+        print(f"Speaker ID 텐서 device: {sid.device}")
+
+        pitch_coarse, pitch_original = None, None
+        if pitch_guidance and f0_method is not None:
+            pitch_coarse, pitch_original = self.get_f0(
+                "input_audio_path",
                 audio_pad,
                 p_len,
                 pitch,
@@ -596,23 +585,76 @@ class Pipeline:
                 f0_autotune_strength,
                 inp_f0,
             )
-            pitch = pitch[:p_len]
-            pitchf = pitchf[:p_len]
-            if self.device == "mps":
-                pitchf = pitchf.astype(np.float32)
-            pitch = torch.tensor(pitch, device=self.device).unsqueeze(0).long()
-            pitchf = torch.tensor(pitchf, device=self.device).unsqueeze(0).float()
-        for t in opt_ts:
-            t = t // self.window * self.window
-            if pitch_guidance:
+            if pitch_coarse is not None and pitch_original is not None:
+                print(
+                    f"F0 coarse 텐서 device: {pitch_coarse.device if isinstance(pitch_coarse, torch.Tensor) else 'NumPy Array'}"
+                )
+                print(
+                    f"F0 original 텐서 device: {pitch_original.device if isinstance(pitch_original, torch.Tensor) else 'NumPy Array'}"
+                )
+                pitch_coarse = pitch_coarse[:p_len]
+                pitch_original = pitch_original[:p_len]
+                if self.device == "mps":
+                    pitch_original = torch.from_numpy(pitch_original).float()
+                pitch_tensor = torch.tensor(pitch_coarse, device=self.device).unsqueeze(0).long()
+                pitchf_tensor = torch.tensor(pitch_original, device=self.device).unsqueeze(0).float()
+                print(f"F0 coarse 텐서 (최종) device: {pitch_tensor.device}")
+                print(f"F0 original 텐서 (최종) device: {pitchf_tensor.device}")
+            else:
+                pitch_guidance = False
+                pitch_tensor, pitchf_tensor = None, None
+        else:
+            pitch_tensor, pitchf_tensor = None, None
+
+        try:  # pipeline 함수 전체를 try-except 로 감싸기
+            for t in opt_ts:
+                t = t // self.window * self.window
+                if pitch_guidance and pitch_tensor is not None and pitchf_tensor is not None:
+                    audio_opt.append(
+                        self.voice_conversion(
+                            model,
+                            net_g,
+                            sid,
+                            audio_pad[s : t + self.t_pad2 + self.window],
+                            pitch_tensor[:, s // self.window : (t + self.t_pad2) // self.window]
+                            if pitch_tensor is not None
+                            else None,
+                            pitchf_tensor[:, s // self.window : (t + self.t_pad2) // self.window]
+                            if pitchf_tensor is not None
+                            else None,
+                            index,
+                            big_npy,
+                            index_rate,
+                            version,
+                            protect,
+                        )[self.t_pad_tgt : -self.t_pad_tgt]
+                    )
+                else:
+                    audio_opt.append(
+                        self.voice_conversion(
+                            model,
+                            net_g,
+                            sid,
+                            audio_pad[s : t + self.t_pad2 + self.window],
+                            None,
+                            None,
+                            index,
+                            big_npy,
+                            index_rate,
+                            version,
+                            protect,
+                        )[self.t_pad_tgt : -self.t_pad_tgt]
+                    )
+                s = t
+            if pitch_guidance and pitch_tensor is not None and pitchf_tensor is not None:
                 audio_opt.append(
                     self.voice_conversion(
                         model,
                         net_g,
                         sid,
-                        audio_pad[s : t + self.t_pad2 + self.window],
-                        pitch[:, s // self.window : (t + self.t_pad2) // self.window],
-                        pitchf[:, s // self.window : (t + self.t_pad2) // self.window],
+                        audio_pad[t:],
+                        pitch_tensor[:, t // self.window :] if t is not None else pitch_tensor,
+                        pitchf_tensor[:, t // self.window :] if t is not None else pitchf_tensor,
                         index,
                         big_npy,
                         index_rate,
@@ -626,7 +668,7 @@ class Pipeline:
                         model,
                         net_g,
                         sid,
-                        audio_pad[s : t + self.t_pad2 + self.window],
+                        audio_pad[t:],
                         None,
                         None,
                         index,
@@ -634,52 +676,24 @@ class Pipeline:
                         index_rate,
                         version,
                         protect,
-                    )[self.t_pad_tgt : -self.t_pad_tgt]
+                        )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
-            s = t
-        if pitch_guidance:
-            audio_opt.append(
-                self.voice_conversion(
-                    model,
-                    net_g,
-                    sid,
-                    audio_pad[t:],
-                    pitch[:, t // self.window :] if t is not None else pitch,
-                    pitchf[:, t // self.window :] if t is not None else pitchf,
-                    index,
-                    big_npy,
-                    index_rate,
-                    version,
-                    protect,
-                )[self.t_pad_tgt : -self.t_pad_tgt]
-            )
-        else:
-            audio_opt.append(
-                self.voice_conversion(
-                    model,
-                    net_g,
-                    sid,
-                    audio_pad[t:],
-                    None,
-                    None,
-                    index,
-                    big_npy,
-                    index_rate,
-                    version,
-                    protect,
-                )[self.t_pad_tgt : -self.t_pad_tgt]
-            )
-        audio_opt = np.concatenate(audio_opt)
-        if volume_envelope != 1:
-            audio_opt = AudioProcessor.change_rms(
-                audio, self.sample_rate, audio_opt, self.sample_rate, volume_envelope
-            )
-        audio_max = np.abs(audio_opt).max() / 0.99
-        if audio_max > 1:
-            audio_opt /= audio_max
-        if pitch_guidance:
-            del pitch, pitchf
-        del sid
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        return audio_opt
+            audio_opt = np.concatenate(audio_opt)
+            if volume_envelope != 1:
+                audio_opt = AudioProcessor.change_rms(
+                    audio, self.sample_rate, audio_opt, self.sample_rate, volume_envelope
+                )
+            audio_max = np.abs(audio_opt).max() / 0.99
+            if audio_max > 1:
+                audio_opt /= audio_max
+            if pitch_guidance and pitch_tensor is not None and pitchf_tensor is not None:
+                del pitch_tensor, pitchf_tensor
+            del sid
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return audio_opt
+
+        except Exception as e:  # pipeline 함수 전체 예외 처리
+            print(f"[PIPELINE ERROR] Error in pipeline function: {e}")  # 오류 로그 강화
+            traceback.print_exc()  # traceback 정보 출력
+            return np.zeros_like(audio, dtype=np.float32)

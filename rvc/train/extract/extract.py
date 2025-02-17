@@ -9,12 +9,23 @@ import numpy as np
 import concurrent.futures
 import multiprocessing as mp
 import json
+import logging  # Import logging
+
+# Set up logging configuration
+logging.basicConfig(
+    level=logging.INFO,  # Set logging level to INFO (디버깅 완료 후 INFO 레벨로 변경)
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),  # Output logs to console
+        logging.FileHandler('extract_log_final.txt', encoding='utf-8')  # Save logs to extract_log_final.txt (최종 로그 파일)
+    ]
+)
 
 now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
 
 # Zluda hijack
-import rvc.lib.zluda
+import rvc.lib.zluda  # Zluda hijack 활성화 (GPU 가속 STFT)
 
 from rvc.lib.utils import load_audio, load_embedding
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
@@ -44,7 +55,7 @@ class FeatureInput:
         elif method == "crepe-tiny":
             return self._get_crepe(audio_array, hop_length, type="tiny")
         elif method == "rmvpe":
-            return self.model_rmvpe.infer_from_audio(audio_array, thred=0.03)
+            return self._get_rmvpe(audio_array, hop_length)
 
     def _get_crepe(self, x, hop_length, type):
         audio = torch.from_numpy(x.astype(np.float32)).to(self.device)
@@ -72,6 +83,15 @@ class FeatureInput:
             )
         )
 
+    def _get_rmvpe(self, audio_array, hop_length):
+        if self.model_rmvpe is None:
+            self.model_rmvpe = RMVPE0Predictor(
+                os.path.join("rvc", "models", "predictors", "rmvpe.pt"),
+                device=self.device,
+            )
+        f0 = self.model_rmvpe.infer_from_audio(audio_array, thred=0.03)
+        return f0
+
     def coarse_f0(self, f0):
         f0_mel = 1127.0 * np.log(1.0 + f0 / 700.0)
         f0_mel = np.clip(
@@ -95,10 +115,12 @@ class FeatureInput:
             np.save(opt_path_full, feature_pit, allow_pickle=False)
             coarse_pit = self.coarse_f0(feature_pit)
             np.save(opt_path_coarse, coarse_pit, allow_pickle=False)
+            logging.info(f"Saving full F0 feature to: {opt_path_full}") # F0 추출 NameError 방지 (try 블록 안으로 이동)
         except Exception as error:
             print(
                 f"An error occurred extracting file {inp_path} on {self.device}: {error}"
             )
+
 
     def process_files(self, files, f0_method, hop_length, device, threads):
         self.device = device
@@ -124,7 +146,7 @@ def run_pitch_extraction(files, devices, f0_method, hop_length, threads):
         f"Starting pitch extraction with {num_processes} cores on {devices_str} using {f0_method}..."
     )
     start_time = time.time()
-    fe = FeatureInput()
+    fe = FeatureInput(device=devices[0] if devices else "cpu") # device 인자 전달
     with concurrent.futures.ProcessPoolExecutor(max_workers=len(devices)) as executor:
         tasks = [
             executor.submit(
@@ -133,7 +155,7 @@ def run_pitch_extraction(files, devices, f0_method, hop_length, threads):
                 f0_method,
                 hop_length,
                 devices[i],
-                threads // len(devices),
+                threads // num_processes,
             )
             for i in range(len(devices))
         ]
@@ -153,7 +175,8 @@ def process_file_embedding(
         wav_file_path, _, _, out_file_path = file_info
         if os.path.exists(out_file_path):
             return
-        feats = torch.from_numpy(load_audio(wav_file_path, 16000)).to(device).float()
+        # TypeError: Cannot convert a MPS Tensor to float64 dtype ... 해결 (astype(np.float32) 추가)
+        feats = torch.from_numpy(load_audio(wav_file_path, 16000).astype(np.float32)).to(device).float() 
         feats = feats.view(1, -1)
         with torch.no_grad():
             result = model(feats)["last_hidden_state"]
@@ -207,6 +230,9 @@ if __name__ == "__main__":
     embedder_model_custom = sys.argv[8] if len(sys.argv) > 8 else None
     include_mutes = int(sys.argv[9]) if len(sys.argv) > 9 else 2
 
+    logging.info("Script started with arguments:")
+    logging.info(f"exp_dir: {exp_dir}, f0_method: {f0_method}, hop_length: {hop_length}, num_processes: {num_processes}, gpus: {gpus}, sample_rate: {sample_rate}, embedder_model: {embedder_model}, embedder_model_custom: {embedder_model_custom}, include_mutes: {include_mutes}")
+
     wav_path = os.path.join(exp_dir, "sliced_audios_16k")
     os.makedirs(os.path.join(exp_dir, "f0"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "f0_voiced"), exist_ok=True)
@@ -236,7 +262,7 @@ if __name__ == "__main__":
         ]
         files.append(file_info)
 
-    devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
+    devices = ["cpu"] if gpus == "-" else ["mps"] if gpus == "mps" else [f"cuda:" + gpus if gpus == "mps" else f"cuda:{idx}" for idx in gpus.split("-")] # MPS 디바이스 문자열 "mps" 로 수정
 
     run_pitch_extraction(files, devices, f0_method, hop_length, num_processes)
 
